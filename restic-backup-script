@@ -1,0 +1,185 @@
+#!/bin/bash
+
+set -euo pipefail
+# === CONFIGURATION ===
+export RESTIC_REPOSITORY="/mnt/backup/restic"
+export RESTIC_PASSWORD_FILE=/.restic-password
+
+# Create repo if it doesn't exist
+if ! restic snapshots &>/dev/null; then
+    echo "Initializing new restic repository at $RESTIC_REPOSITORY"
+    restic init
+fi
+
+# Timestamp
+timestamp=$(date +%Y%m%d_%H%M%S)
+
+# === DATA VOLUMES TO BACK UP ===
+# Replace these with your actual Docker volume paths or bind mounts
+PAPERLESS_MEDIA="/home/marin/shared/media/paperless/media" #documents
+PAPERLESS_DATA="/home/marin/shared/media/paperless/data" #DBConfig
+#PAPERLESS_PGDATA="/var/lib/docker/volumes/paperless-stack_pgdata/_data" #Postgre data
+IMMICH_UPLOAD="/home/marin/shared/media/immich/library"
+JELLYFIN_CONFIG="/home/marin/shared/media/jellyfin/config"
+JELLYFIN_MEDIA="/home/marin/shared/media/jellyfin/media"
+NEXTCLOUD="/home/marin/shared/media/nextcloud/data" #--exclude core --exclude updater
+# Add any other volumes or folders here
+# EXTRA_DATA="/srv/media /etc/docker /home/pi/docker-configs"
+
+# Nextcloud paths
+nextcloud_backup_dir="/mnt/backup/restic/nextcloud"
+mkdir -p "$nextcloud_backup_dir"
+rsync -aavx "$NEXTCLOUD"/ "$nextcloud_backup_dir"/
+
+# Nextcloud DB dump (MariaDB example)
+docker exec nextcloud_db mariadb-dump --single-transaction --default-character-set=utf8mb4 -u root -p'rtpwd' nextcloud > "$nextcloud_backup_dir/nextcloud-db.sql"
+
+# Gitea
+su - git -c "/path/to/gitea dump -c /etc/gitea/app.ini -f /mnt/backups/restic/gitea.zip"
+
+# Paperless
+paperless_backup_dir="/mnt/backup/restic/paperless"
+mkdir -p $paperless_backup_dir
+docker exec paperless-stack-db-1 pg_dump --clean --if-exists --username=paperless paperless > $paperless_backup_dir/paperless-db.sql
+# Paperless export
+docker exec -t paperless-stack-webserver-1 document_exporter ../export
+rsync -aavx /home/marin/shared/media/paperless/export "$paperless_backup_dir"
+
+# Immich DB dump (Postgres inside Docker)
+immich_backup_dir="/mnt/backup/restic/immich"
+mkdir -p "$immich_backup_dir"
+docker exec -t immich_postgres pg_dumpall --clean --if-exists --username=postgres > "$immich_backup_dir/immich-db.sql"
+
+# === RUN BACKUP ===
+restic backup "$nextcloud_backup_dir" --exclude core --exclude updater --tag nextcloud --tag "$timestamp"
+restic backup \
+  "$PAPERLESS_MEDIA" \
+  "$PAPERLESS_DATA" \
+  "$IMMICH_UPLOAD" \
+  /tmp/dbdumps/nextcloud.sql \
+  /tmp/dbdumps/paperless.sql \
+  "$JELLYFIN_CONFIG" \
+  "$JELLYFIN_MEDIA" \
+  $EXTRA_DATA \
+  --tag auto-backup \
+  --host raspberrypi \
+  --verbose
+
+# === CLEAN UP TEMP FILES ===
+rm -f /tmp/dbdumps/paperless.sql
+
+# === OPTIONAL: PRUNE OLD BACKUPS ===
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+
+echo "✅ Backup completed at $timestamp"
+
+
+
+
+
+
+# Jellyfin
+jellyfin_backup_dir="/mnt/backups/jellyfin_$timestamp"
+mkdir -p "$jellyfin_backup_dir"
+cp -a /var/lib/jellyfin "$jellyfin_backup_dir"/data
+cp -a /etc/jellyfin "$jellyfin_backup_dir"/config
+
+
+
+# Restic backup
+restic backup "$nextcloud_backup_dir" "$jellyfin_backup_dir" /mnt/backups/gitea_$timestamp.zip --tag "services-backup" --tag "$timestamp"
+
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+
+# (Optional) Clean up temporary backup dirs
+rm -rf "$nextcloud_backup_dir" "$jellyfin_backup_dir"
+
+#!/bin/bash
+
+
+# ------------------------------
+# Backup: Nextcloud
+# ------------------------------
+echo "Backing up Nextcloud..."
+
+# Dump MariaDB
+docker exec nextcloud-db mysqldump -u root --password=your_db_password nextcloud > /tmp/nextcloud.sql
+
+# Back up config, data, and DB dump
+restic backup \
+  /mnt/docker/nextcloud/config \
+  /mnt/docker/nextcloud/data \
+  /tmp/nextcloud.sql \
+  --tag nextcloud \
+  --tag "$TIMESTAMP"
+
+rm /tmp/nextcloud.sql
+
+# ------------------------------
+# Backup: Jellyfin
+# ------------------------------
+echo "Backing up Jellyfin..."
+
+restic backup \
+  /mnt/docker/jellyfin/config \
+  /mnt/docker/jellyfin/cache \
+  --tag jellyfin \
+  --tag "$TIMESTAMP"
+
+# ------------------------------
+# Backup: Immich
+# ------------------------------
+echo "Backing up Immich..."
+
+IMMICH_BACKUP_DIR="/mnt/docker/immich/backup"
+mkdir -p "$IMMICH_BACKUP_DIR"
+
+# Dump Postgres
+docker exec immich-postgres pg_dump -U postgres -d immich > "$IMMICH_BACKUP_DIR/immich.sql"
+
+restic backup \
+  "$IMMICH_BACKUP_DIR" \
+  /mnt/docker/immich/upload \
+  --tag immich \
+  --tag "$TIMESTAMP"
+
+# ------------------------------
+# Backup: Paperless
+# ------------------------------
+echo "Backing up Paperless..."
+
+EXPORT_DIR="/mnt/docker/paperless/export"
+mkdir -p "$EXPORT_DIR"
+docker exec paperless document_exporter /usr/src/paperless/export/
+
+restic backup \
+  "$EXPORT_DIR" \
+  --tag paperless \
+  --tag "$TIMESTAMP"
+
+# ------------------------------
+# Backup: Gitea
+# ------------------------------
+echo "Backing up Gitea..."
+
+GITEA_DUMP="/tmp/gitea-dump-${TIMESTAMP}.zip"
+docker exec gitea sh -c "gitea dump -c /data/gitea/conf/app.ini -f /data/gitea/dump.zip"
+docker cp gitea:/data/gitea/dump.zip "$GITEA_DUMP"
+
+restic backup \
+  "$GITEA_DUMP" \
+  --tag gitea \
+  --tag "$TIMESTAMP"
+
+rm "$GITEA_DUMP"
+
+# ------------------------------
+# Backup: Final Prune & Check
+# ------------------------------
+echo "Pruning old Restic snapshots..."
+restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+
+echo "Running restic check..."
+restic check
+
+echo "✅ Backup complete."
