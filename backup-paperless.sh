@@ -21,3 +21,11 @@ rm -rf $paperless_temp
 # Restic backup
 restic backup $paperless_backup_dir --tag paperless
 restic forget --path=$paperless_backup_dir --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+
+# Sync with Hetzner Restic Repository
+RESTIC_PASSWORD=$(< /.hetzner-restic-password)
+mkdir -p $paperless_temp
+sudo -u marin echo $RESTIC_PASSWORD > $paperless_temp/hetzner-cred
+sudo -u marin restic -r sftp:u466621@u466621.your-storagebox.de:/backup/restic --password-file $paperless_temp/hetzner-cred backup /mnt/backup/restic/paperless --tag paperless
+sudo -u marin restic -r sftp:u466621@u466621.your-storagebox.de:/backup/restic --password-file $paperless_temp/hetzner-cred forget --path=/mnt/backup/restic/paperless --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+rm -rf $paperless_temp
