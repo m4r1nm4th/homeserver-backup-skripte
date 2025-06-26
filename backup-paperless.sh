@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+set -v
 # === CONFIGURATION ===
 export RESTIC_REPOSITORY="/mnt/backup/restic"
 export RESTIC_PASSWORD_FILE=/.restic-password
